@@ -4,7 +4,7 @@ One native Qt interface built with **PySide6 / Qt for Python**. Retains the upst
 
 * Editable port discovery list (manual ports and `DSISerialPort` still work).
 * Startup impedance checkbox, live Impedance on/off buttons, and an analog Reset button with an EEG-disturbance warning.
-* Physical-electrode + CMF impedance table, displayed in **kΩ**. LSL continues publishing **ohms**. Vendor contact thresholds: below 1 MΩ good, 1–2 MΩ fair, 2 MΩ or more poor; these are not EEG-quality guarantees.
+* Physical-electrode estimates are displayed in **kΩ**; LSL publishes electrode estimates in **ohms**. Vendor contact thresholds: below 1 MΩ Good, 1–2 MΩ Fair, 2 MΩ or more Poor; these are not EEG-quality guarantees. CMF is a separate **unitless** metric, shown raw to one decimal as `Common-mode fault (CMF=…)`, with the note `Not a contact rating`.
 * API-observed driver/reset state, settling/unavailable status, EEG sample count, and a stale-data warning. Values are hidden after three seconds without new sample telemetry; old values are never presented as live.
 * Check libraries without connecting a headset, backend executable selection, verbosity, saved setup fields, and log export (last 2,000 displayed lines).
 * Asynchronous graceful shutdown, including closing the window. A stalled shutdown exposes an explicitly confirmed Force stop option; it never silently kills the acquisition process.
@@ -47,7 +47,9 @@ On the development Mac, the existing `python3` environment already contains PySi
 
 See **[the exact Windows PowerShell commands](../WINDOWS_BUILD.md)** for building and packaging on Windows using a fresh `build-windows` folder.
 
-The table initially shows `—`. It stays unavailable while impedance is off, a reset is active, or the estimate is settling. Reset means the DSI-Streamer-style **analog amplifier reset**, not impedance recalibration. Its request/return and any observed transitions remain recorded in the LSL marker stream.
+The table initially shows `—`. It stays unavailable while impedance is off, a reset is active, or the estimate is settling. Electrode estimates are in ohms at the backend and displayed in kΩ; after enabling impedance or releasing reset, allow the 2-second settling period before reading them. The CMF row shows the vendor's unitless value to one decimal and explicitly says it is not a contact rating; the electrode Good/Fair/Poor thresholds do not apply to CMF.
+
+Reset means the DSI-Streamer-style **analog amplifier reset**, not impedance recalibration. The backend starts reset, holds it for the configured interval (1 second by default), then releases it. Reset phases are `idle`, `holding`, `releasing`, and `failed`; the status area shows `Reset: holding`, `Reset: releasing`, or `Reset: failed — reconnect` as applicable. Reset and Impedance on/off controls are disabled while holding or releasing, and impedance readings are hidden unless reset phase is idle. If release fails, reconnect to recover; if the API later reports reset mode 0, the backend returns to idle. Request/start/release/failure, observed transitions, and periodic state snapshots remain recorded in the LSL marker stream. See the root README's [Analog reset](../README.md#analog-reset) section for SDK behavior and sources.
 
 ## Create a double-clickable application
 

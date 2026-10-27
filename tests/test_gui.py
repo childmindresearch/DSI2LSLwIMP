@@ -30,7 +30,7 @@ def wait_until(predicate, seconds=5):
 class ProtocolTests(unittest.TestCase):
     def test_actual_c_backend_telemetry_with_mock_headset(self):
         root = Path(__file__).resolve().parent.parent
-        candidates = [root / "build" / "test_impedance", root / "build-windows" / "Release" / "test_impedance.exe",
+        candidates = [root / "build-fix" / "test_impedance", root / "build" / "test_impedance", root / "build-windows" / "Release" / "test_impedance.exe",
                       root / "build" / "Release" / "test_impedance.exe"]
         backend = next((p for p in candidates if p.is_file()), None)
         if backend is None:
@@ -55,6 +55,16 @@ class ProtocolTests(unittest.TestCase):
                         Options(stream_name="é" * 100)):
             with self.assertRaises(ValueError):
                 options.arguments()
+
+    def test_reset_phase_validation(self):
+        base = {"protocol": 1, "type": "state", "driver_mode": 1, "reset_mode": 0, "requested_on": 1,
+                "command_pending": 0, "impedance_ready": 1, "sample_count": 0, "impedance": []}
+        for phase in ("idle", "holding", "releasing", "failed"):
+            self.assertEqual(decode_record("DSI_GUI " + json.dumps({**base, "reset_phase": phase}))["reset_phase"], phase)
+        self.assertEqual(decode_record("DSI_GUI " + json.dumps(base))["reset_phase"], "idle")
+        for phase in ("stuck", 1, None):
+            with self.assertRaises(ValueError):
+                decode_record("DSI_GUI " + json.dumps({**base, "reset_phase": phase}))
 
     def test_malformed_and_nonfinite_telemetry(self):
         self.assertIsNone(decode_record("diagnostic log"))
@@ -108,8 +118,8 @@ class QtTests(unittest.TestCase):
         self.assertEqual(self.window.table.item(0, 2).text(), "Good contact")
         count = c.state["sample_count"]
         self.assertTrue(c.send("reset"))  # Button confirmation is handled separately by the UI.
-        wait_until(lambda: "analog_reset_command_returned" in self.events)
-        wait_until(lambda: c.state["sample_count"] > count)
+        wait_until(lambda: "analog_reset_started" in self.events)
+        wait_until(lambda: c.state["sample_count"] > count and c.state["reset_phase"] == "idle")
         self.window.imp_off.click()
         wait_until(lambda: c.state["driver_mode"] == 0 and c.pending_command is None)
         self.assertEqual(self.window.table.item(0, 1).text(), "—")
@@ -120,6 +130,56 @@ class QtTests(unittest.TestCase):
         self.assertTrue(self.window.start.isEnabled())
         self.window.disconnect.click()
         wait_until(lambda: not c.busy)
+
+    def test_normal_reset_disables_controls_then_impedance_returns(self):
+        self.window.startup_impedance.setChecked(True)
+        self.start_fake()
+        c = self.window.controller
+        wait_until(lambda: c.state["impedance_ready"] == 1)
+        self.assertTrue(c.send("reset"))
+        wait_until(lambda: c.state["reset_phase"] == "holding")
+        self.assertIn("holding", self.window.reset_status.text())
+        for button in (self.window.reset, self.window.imp_on, self.window.imp_off):
+            self.assertFalse(button.isEnabled())
+        self.assertEqual(self.window.table.item(0, 1).text(), "—")
+        wait_until(lambda: c.state["reset_phase"] == "releasing")
+        self.assertIn("releasing", self.window.reset_status.text())
+        self.assertFalse(self.window.imp_off.isEnabled())
+        wait_until(lambda: c.state["reset_phase"] == "idle" and c.state["impedance_ready"] == 1)
+        self.assertIn("analog_reset_released", self.events)
+        self.assertEqual(self.window.table.item(0, 1).text(), "123.0")
+        self.assertTrue(self.window.reset.isEnabled())
+        self.assertTrue(self.window.imp_off.isEnabled())
+
+    def test_stuck_reset_is_shown_as_failure(self):
+        self.window.port.setEditText("SIM_RESET_STUCK")
+        self.window.startup_impedance.setChecked(True)
+        self.start_fake()
+        c = self.window.controller
+        self.assertTrue(c.send("reset"))
+        wait_until(lambda: c.state["reset_phase"] == "failed")
+        self.assertEqual(self.window.reset_status.text(), "Reset: failed — reconnect")
+        self.assertIn("analog_reset_release_failed", self.events)
+        self.assertIn("reset release failed", self.window.console.toPlainText())
+        self.assertFalse(self.window.reset.isEnabled())
+        self.assertTrue(self.window.imp_off.isEnabled())  # Safety-off stays available.
+        self.assertEqual(self.window.table.item(0, 1).text(), "—")
+
+    def test_cmf_raw_and_electrode_ratings(self):
+        self.window.startup_impedance.setChecked(True)
+        self.start_fake()
+        c = self.window.controller
+        wait_until(lambda: c.state["impedance_ready"] == 1)
+        self.assertIn("Common-mode fault", self.window.table.item(1, 0).text())
+        self.assertEqual(self.window.table.item(1, 1).text(), "456000.0")  # Raw, not kΩ.
+        self.assertEqual(self.window.table.item(1, 2).text(), "Not a contact rating")
+        c.state = {**c.state, "impedance": [1_500_000, 2_500_000]}
+        c.last_data = time.monotonic()
+        self.window._render()
+        self.assertEqual(self.window.table.item(0, 1).text(), "1,500.0")
+        self.assertEqual(self.window.table.item(0, 2).text(), "Fair contact")
+        self.assertEqual(self.window.table.item(1, 1).text(), "2500000.0")
+        self.assertEqual(self.window.table.item(1, 2).text(), "Not a contact rating")
 
     def test_stale_data_is_not_displayed_as_live(self):
         self.window.startup_impedance.setChecked(True)
@@ -159,7 +219,7 @@ class QtTests(unittest.TestCase):
         self.assertNotIn("analog_reset_requested", self.events)
         with patch("GUI.main.QMessageBox.warning", return_value=QMessageBox.StandardButton.Yes):
             self.window.reset.click()
-        wait_until(lambda: "analog_reset_command_returned" in self.events)
+        wait_until(lambda: "analog_reset_started" in self.events)
 
     def test_failed_start_and_connection_error(self):
         c = self.window.controller

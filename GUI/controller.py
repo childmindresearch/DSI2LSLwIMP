@@ -147,8 +147,12 @@ class BackendController(QObject):
                     self.stage = "ready"
                     self.last_data = None
                 returned = {"on": "impedance_on_command_returned", "off": "impedance_off_command_returned",
-                            "reset": "analog_reset_command_returned", "start": "acquisition_started",
+                            "reset": "analog_reset_started", "start": "acquisition_started",
                             "stop": "acquisition_stopped"}
+                if event == "analog_reset_release_failed":
+                    self.log.emit("ERROR: analog reset release failed — amplifier may still be held. Disconnect and reconnect the headset.")
+                elif event == "analog_reset_unexpectedly_held":
+                    self.log.emit("Warning: amplifier reported an unexpected held reset; releasing it.")
                 if event == returned.get(self.pending_command) or event.endswith("_command_failed"):
                     self.pending_command = None
                 self.event_received.emit(event)

@@ -161,13 +161,13 @@ class MainWindow(QMainWindow):
         table_box = QGroupBox("Electrode contact estimates")
         table_layout = QVBoxLayout(table_box)
         self.table = QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(["Electrode", "Impedance (kΩ)", "Contact"])
+        self.table.setHorizontalHeaderLabels(["Electrode", "Impedance (kΩ) / CMF (raw)", "Contact"])
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.verticalHeader().hide()
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         table_layout.addWidget(self.table)
-        hint = QLabel("— = off, resetting, settling, unavailable, or stale.\nContact ratings are not an EEG quality guarantee.")
+        hint = QLabel("— = off, resetting, settling, unavailable, or stale. Common-mode fault is unitless.\nContact ratings are not an EEG quality guarantee.")
         hint.setWordWrap(True)
         table_layout.addWidget(hint)
         console_box = QGroupBox("Backend log")
@@ -293,6 +293,13 @@ class MainWindow(QMainWindow):
             self.table.setItem(row, 0, QTableWidgetItem(label))
             self.table.setItem(row, 1, QTableWidgetItem("—"))
             self.table.setItem(row, 2, QTableWidgetItem("Unavailable"))
+            if label.startswith("CMF"):
+                self.table.item(row, 0).setText(f"Common-mode fault ({label})")
+                self.table.item(row, 0).setData(Qt.ItemDataRole.UserRole, "cmf")
+
+    def _is_cmf(self, row):
+        item = self.table.item(row, 0)
+        return item is not None and item.data(Qt.ItemDataRole.UserRole) == "cmf"
 
     def _render(self):
         c = self.controller
@@ -304,10 +311,13 @@ class MainWindow(QMainWindow):
         self.stop.setEnabled(c.stage == "acquiring" and not c.pending_command)
         self.disconnect.setEnabled(busy and c.stage != "stopping")
         state = c.state or {}
-        runtime = c.stage == "acquiring" and not c.pending_command and not state.get("command_pending")
+        phase = state.get("reset_phase", "idle")
+        resetting = phase in ("holding", "releasing")  # Backend owns the hold→release sequence.
+        runtime = (c.stage == "acquiring" and not c.pending_command and not state.get("command_pending")
+                   and not resetting)
         self.imp_on.setEnabled(runtime and state.get("driver_mode") != 1)
-        self.imp_off.setEnabled(runtime)  # Always allow an explicit safety-off command.
-        self.reset.setEnabled(runtime and state.get("reset_mode") == 0)
+        self.imp_off.setEnabled(runtime)  # Allow an explicit safety-off command except mid-reset.
+        self.reset.setEnabled(runtime and phase == "idle" and state.get("reset_mode") == 0)
         stale = c.last_data is None or time.monotonic() - c.last_data > 3
         if c.stage == "acquiring":
             if c.last_data is None:
@@ -342,10 +352,17 @@ class MainWindow(QMainWindow):
             self.impedance_status.setText("Impedance: unknown / disconnected")
         if busy and state:
             reset = state["reset_mode"]
-            self.reset_status.setText("Reset: " + ("inactive" if reset == 0 else f"active/unknown (mode {reset})") +
-                                      (" (last reported)" if stale else ""))
+            if phase == "failed":
+                text = "failed — reconnect"
+            elif phase in ("holding", "releasing"):
+                text = phase
+            else:
+                text = "inactive" if reset == 0 else f"active/unknown (mode {reset})"
+            self.reset_status.setText("Reset: " + text + (" (last reported)" if stale else ""))
+            self.reset_status.setStyleSheet("color: #c0392b; font-weight: 600;" if phase == "failed" else "")
         else:
             self.reset_status.setText("Reset: unknown")
+            self.reset_status.setStyleSheet("")
         if busy and c.config:
             config = c.config
             self.device_status.setText(f"{config.get('model', 'DSI')} · serial {config.get('serial', '?')} · "
@@ -353,12 +370,18 @@ class MainWindow(QMainWindow):
         elif not busy:
             self.device_status.setText("No headset connected")
         unavailable = (c.stage != "acquiring" or stale or bool(c.pending_command) or
-                       not state.get("impedance_ready"))
+                       not state.get("impedance_ready") or phase != "idle")
         values = state.get("impedance", [])
         for row in range(self.table.rowCount()):
             value = values[row] if row < len(values) and not unavailable else None
             rating = "Stale" if busy and stale and c.last_data is not None else "Unavailable"
             color = self.palette().text().color()
+            if self._is_cmf(row):
+                # Common-mode fault is a unitless vendor metric: raw value, no contact rating.
+                self.table.item(row, 1).setText("—" if value is None else f"{value:.1f}")
+                self.table.item(row, 2).setText("Not a contact rating" if value is not None else rating)
+                self.table.item(row, 2).setForeground(color)
+                continue
             if value is not None:
                 rating = "Good contact" if value < 1_000_000 else ("Fair contact" if value < 2_000_000 else "Poor contact")
                 color = QColor("#278347" if value < 1_000_000 else "#a16b00" if value < 2_000_000 else "#c0392b")
