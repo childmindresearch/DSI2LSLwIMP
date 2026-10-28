@@ -167,7 +167,7 @@ class MainWindow(QMainWindow):
         self.table.verticalHeader().hide()
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         table_layout.addWidget(self.table)
-        hint = QLabel("— = off, resetting, settling, unavailable, or stale. Common-mode fault is unitless.\nContact ratings are not an EEG quality guarantee.")
+        hint = QLabel("— = off, resetting, settling, unavailable, or stale. CMF = Common-mode follower, raw value, units unspecified (not kΩ).\nContact ratings are not an EEG quality guarantee.")
         hint.setWordWrap(True)
         table_layout.addWidget(hint)
         console_box = QGroupBox("Backend log")
@@ -294,7 +294,10 @@ class MainWindow(QMainWindow):
             self.table.setItem(row, 1, QTableWidgetItem("—"))
             self.table.setItem(row, 2, QTableWidgetItem("Unavailable"))
             if label.startswith("CMF"):
-                self.table.item(row, 0).setText(f"Common-mode fault ({label})")
+                self.table.item(row, 0).setText(f"Common-mode follower ({label}, raw)")
+                tip = "Common-mode follower reading; units unspecified by the cited documentation. Shown raw, not kΩ; electrode contact ratings do not apply."
+                for col in range(3):
+                    self.table.item(row, col).setToolTip(tip)
                 self.table.item(row, 0).setData(Qt.ItemDataRole.UserRole, "cmf")
 
     def _is_cmf(self, row):
@@ -377,7 +380,7 @@ class MainWindow(QMainWindow):
             rating = "Stale" if busy and stale and c.last_data is not None else "Unavailable"
             color = self.palette().text().color()
             if self._is_cmf(row):
-                # Common-mode fault is a unitless vendor metric: raw value, no contact rating.
+                # Common-mode follower: units unspecified; show raw value, never convert or rate as electrode kΩ.
                 self.table.item(row, 1).setText("—" if value is None else f"{value:.1f}")
                 self.table.item(row, 2).setText("Not a contact rating" if value is not None else rating)
                 self.table.item(row, 2).setForeground(color)

@@ -170,7 +170,8 @@ class QtTests(unittest.TestCase):
         self.start_fake()
         c = self.window.controller
         wait_until(lambda: c.state["impedance_ready"] == 1)
-        self.assertIn("Common-mode fault", self.window.table.item(1, 0).text())
+        self.assertEqual(self.window.table.item(1, 0).text(), "Common-mode follower (CMF=Pz, raw)")
+        self.assertIn("units unspecified", self.window.table.item(1, 0).toolTip())
         self.assertEqual(self.window.table.item(1, 1).text(), "456000.0")  # Raw, not kΩ.
         self.assertEqual(self.window.table.item(1, 2).text(), "Not a contact rating")
         c.state = {**c.state, "impedance": [1_500_000, 2_500_000]}

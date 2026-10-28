@@ -204,16 +204,19 @@ int main(void)
     REQUIRE(lsl_get_channel_count(info) == 2);
     REQUIRE(lsl_get_nominal_srate(info) == 0);
     REQUIRE(!strcmp(lsl_child_value_n(lsl_child(lsl_child(lsl_get_desc(info), "channels"), "channel"), "unit"), "ohms"));
-    REQUIRE(strstr(lsl_child_value_n(lsl_get_desc(info), "cmf_note"), "unitless") != NULL);
+    REQUIRE(!strcmp(lsl_child_value_n(lsl_get_desc(info), "cmf_note"), "Common-mode follower reading; units unspecified by the cited documentation."));
     lsl_destroy_streaminfo(info);
     {
-        char v[64];
+        char v[128];
         REQUIRE(!strcmp(channel_child(a.eeg, 0, "type", v, sizeof v), "EEG"));
         REQUIRE(!strcmp(channel_child(a.eeg, 0, "unit", v, sizeof v), "microvolts"));
         REQUIRE(!strcmp(channel_child(a.eeg, 1, "type", v, sizeof v), "Trigger"));
         REQUIRE(!strcmp(channel_child(a.eeg, 1, "unit", v, sizeof v), "integer"));
         REQUIRE(!strcmp(channel_child(a.impedance, 0, "type", v, sizeof v), "Impedance"));
-        REQUIRE(!strcmp(channel_child(a.impedance, 1, "type", v, sizeof v), "CommonModeFault"));
+        REQUIRE(!strcmp(channel_child(a.impedance, 1, "type", v, sizeof v), "CommonModeFollower"));
+        REQUIRE(!strcmp(channel_child(a.impedance, 1, "label", v, sizeof v), "CMF=Pz"));
+        REQUIRE(!strcmp(channel_child(a.impedance, 1, "description", v, sizeof v),
+                        "Common-mode follower reading; units unspecified by the cited documentation."));
         REQUIRE(!strcmp(channel_child(a.impedance, 1, "unit", v, sizeof v), "")); /* No unit element. */
         info = lsl_get_info(a.eeg);
         REQUIRE(!strcmp(lsl_child_value_n(lsl_get_desc(info), "timestamp_method"), "nominal_rate_anchored_to_packet_time"));

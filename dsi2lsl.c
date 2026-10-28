@@ -433,7 +433,7 @@ static void channel_metadata(lsl_xml_ptr channels, const char *label, const char
     lsl_xml_ptr ch = lsl_append_child(channels, "channel");
     lsl_append_child_value(ch, "label", label);
     lsl_append_child_value(ch, "type", type);
-    if (unit) lsl_append_child_value(ch, "unit", unit); /* NULL: unitless, no unit element. */
+    if (unit) lsl_append_child_value(ch, "unit", unit); /* NULL: units unspecified, no unit element. */
 }
 
 static int init_streams(App *a, const char *name)
@@ -495,14 +495,14 @@ static int init_streams(App *a, const char *name)
     lsl_append_child_value(desc, "poll_interval_seconds", "1");
     lsl_append_child_value(desc, "invalid_value", "NaN: off, resetting, settling, negative or nonfinite API estimate");
     lsl_append_child_value(desc, "measurement", "physical_sources_not_montage_channels");
-    lsl_append_child_value(desc, "cmf_note", "Common-mode fault metric, unitless per vendor tutorial");
+    lsl_append_child_value(desc, "cmf_note", "Common-mode follower reading; units unspecified by the cited documentation.");
     channels = lsl_append_child(desc, "channels");
     for (i = 0; i < a->source_count; ++i)
         channel_metadata(channels, DSI_Source_GetName(a->sources[i]), "Impedance", "ohms");
     snprintf(cmf_label, sizeof(cmf_label), "CMF=%s", DSI_Headset_GetFactoryReferenceString(a->h));
-    channel_metadata(channels, cmf_label, "CommonModeFault", NULL);
+    channel_metadata(channels, cmf_label, "CommonModeFollower", NULL);
     lsl_append_child_value(lsl_last_child(channels), "description",
-                           "Common-mode fault metric, unitless per vendor tutorial");
+                           "Common-mode follower reading; units unspecified by the cited documentation.");
     a->impedance = lsl_create_outlet(info, 0, 360);
     lsl_destroy_streaminfo(info);
     if (!a->impedance) return -1;
@@ -643,7 +643,7 @@ static void help(const char *program)
         "  --gui-telemetry            Emit DSI_GUI JSON records on stdout (GUI integration)\n"
         "  --auto-start               Start acquisition immediately (default: wait for start)\n"
         "Runtime stdin commands + Enter: start, stop, on/i, off/o, reset/r, status/s, quit/q\n"
-        "Creates EEG, NAME-Impedance (electrodes ohms, CMF unitless), NAME-ImpedanceMarkers streams.\n"
+        "Creates EEG, NAME-Impedance (electrodes ohms; CMF = common-mode follower, raw, units unspecified), NAME-ImpedanceMarkers streams.\n"
         "Default: advertise all outlets, then wait for start; stop keeps outlets alive.\n"
         "EEG remains unfiltered. Reset is an analog amplifier reset, not impedance calibration:\n"
         "  reset starts it, holds --reset-hold seconds, releases it and waits up to 3 s for mode 0;\n"
