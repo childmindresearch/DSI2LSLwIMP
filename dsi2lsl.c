@@ -38,7 +38,23 @@ typedef struct {
     unsigned long long sample_count;
     double last_impedance_time;
     int acquiring, acquisition_attempted, recording_events, startup_impedance;
+    /* Analog reset: hold, then release, then confirm mode 0 (main loop only). */
+    int reset_phase, unexpected_reset_reported;
+    double reset_hold_seconds, reset_deadline;
+    /* EEG timestamps: t = offset + base_packet_time + (k - base_k) / fs. */
+    double ts_fs, ts_offset, ts_base_pt, ts_last_pt, ts_window_start, ts_window_min, ts_prev_window_min;
+    unsigned long long ts_k, ts_base_k;
+    int ts_packet_len, ts_started, ts_fallback;
 } App;
+
+enum { RESET_IDLE, RESET_HOLDING, RESET_RELEASING, RESET_FAILED };
+static const char *const reset_phase_names[] = { "idle", "holding", "releasing", "failed" };
+#define RESET_CONFIRM_SECONDS 3.0
+#define TS_WINDOW_SECONDS 10.0
+#define TS_MAX_SLEW_PER_PACKET 0.00005 /* Keeps inter-sample spacing within 0.05 ms of 1/fs. */
+
+/* DSI.h declares bool_t as int, but the library only sets the low byte; upper bytes are garbage. */
+#define DSI_BOOL(r) ((((unsigned int)(r)) & 0xFFu) != 0)
 
 static volatile sig_atomic_t keep_running = 1;
 static void quit_handler(int sig) { (void)sig; keep_running = 0; }
@@ -86,18 +102,24 @@ static void json_string(const char *text)
     putchar('"');
 }
 
+static int impedance_ready(App *a, double now)
+{
+    return a->driver_mode == 1 && a->reset_mode == 0 && a->reset_phase == RESET_IDLE &&
+           !a->command_pending && now >= a->valid_after;
+}
+
 static void gui_state(App *a, double now)
 {
     int i, ready;
     if (!a->gui_telemetry) return;
-    ready = a->acquiring && a->driver_mode == 1 && a->reset_mode == 0 && !a->command_pending && now >= a->valid_after;
+    ready = a->acquiring && impedance_ready(a, now);
     printf("DSI_GUI {\"protocol\":1,\"type\":\"state\",\"timestamp\":%.6f,"
-           "\"driver_mode\":%d,\"reset_mode\":%d,\"requested_on\":%d,"
+           "\"driver_mode\":%d,\"reset_mode\":%d,\"reset_phase\":\"%s\",\"requested_on\":%d,"
            "\"command_pending\":%d,\"impedance_ready\":%d,\"sample_count\":%llu,"
            "\"impedance_timestamp\":%.6f,\"acquiring\":%d,"
            "\"eeg_subscribers\":%d,\"impedance_subscribers\":%d,\"marker_subscribers\":%d,\"impedance\":[",
-           now, a->driver_mode, a->reset_mode, a->requested_on, a->command_pending,
-           ready, a->sample_count, a->last_impedance_time, a->acquiring,
+           now, a->driver_mode, a->reset_mode, reset_phase_names[a->reset_phase],
+           a->requested_on, a->command_pending, ready, a->sample_count, a->last_impedance_time, a->acquiring,
            a->eeg ? lsl_have_consumers(a->eeg) : 0,
            a->impedance ? lsl_have_consumers(a->impedance) : 0,
            a->markers ? lsl_have_consumers(a->markers) : 0);
@@ -152,11 +174,11 @@ static void marker(App *a, const char *event, double now)
 
 static void snapshot(App *a, double now)
 {
-    char text[160];
+    char text[200];
     snprintf(text, sizeof(text),
-             "state driver_mode=%d reset_mode=%d requested_on=%d command_pending=%d impedance_ready=%d",
+             "state driver_mode=%d reset_mode=%d requested_on=%d command_pending=%d impedance_ready=%d reset_phase=%s",
              a->driver_mode, a->reset_mode, a->requested_on, a->command_pending,
-              a->acquiring && a->driver_mode == 1 && a->reset_mode == 0 && !a->command_pending && now >= a->valid_after);
+             a->acquiring && impedance_ready(a, now), reset_phase_names[a->reset_phase]);
     marker(a, text, now);
     gui_state(a, now);
 }
@@ -209,22 +231,139 @@ static int set_impedance(App *a, int on)
     return observe_state(a);
 }
 
+/* Release a held analog reset and wait (nonblocking) for mode 0. Failure is reported, not fatal. */
+static void release_reset(App *a, double now)
+{
+    DSI_Headset_ReleaseAnalogReset(a->h);
+    if (check_dsi("Release analog reset")) {
+        a->reset_phase = RESET_FAILED;
+        marker(a, "analog_reset_release_failed", lsl_local_clock());
+    } else {
+        a->reset_phase = RESET_RELEASING;
+        a->reset_deadline = now + RESET_CONFIRM_SECONDS;
+        marker(a, "analog_reset_released", lsl_local_clock());
+    }
+    gui_state(a, lsl_local_clock());
+}
+
+/* Start, hold, release. Never LockAnalogReset: it invalidates signal data until released. */
 static int analog_reset(App *a)
 {
+    double now;
     a->command_pending = 1;
     a->valid_after = HUGE_VAL;
     marker(a, "analog_reset_requested", lsl_local_clock());
     gui_state(a, lsl_local_clock());
-    /* One-shot reset. Do NOT LockAnalogReset: that invalidates signal data indefinitely. */
     DSI_Headset_StartAnalogReset(a->h);
     a->command_pending = 0;
     if (check_dsi("Analog reset")) {
         marker(a, "analog_reset_command_failed", lsl_local_clock());
         return -1;
     }
-    a->valid_after = lsl_local_clock() + a->settle_seconds;
-    marker(a, "analog_reset_command_returned", lsl_local_clock());
+    now = lsl_local_clock();
+    a->reset_phase = RESET_HOLDING;
+    a->reset_deadline = now + a->reset_hold_seconds;
+    marker(a, "analog_reset_started", now);
     return observe_state(a);
+}
+
+/* Some firmware leaves a reset held from an earlier session; clear it before streaming. */
+static void clear_reset_on_connect(App *a)
+{
+    double now = lsl_local_clock();
+    DSI_Headset_ReleaseAnalogReset(a->h);
+    if (check_dsi("Release analog reset on connect")) {
+        a->reset_phase = RESET_FAILED;
+        marker(a, "analog_reset_release_failed", now);
+        return;
+    }
+    a->reset_phase = RESET_RELEASING;
+    a->reset_deadline = now + RESET_CONFIRM_SECONDS;
+    marker(a, "analog_reset_cleared_on_connect", now);
+}
+
+/* Main-loop reset state machine; call after observe_state. */
+static void reset_tick(App *a, double now)
+{
+    switch (a->reset_phase) {
+    case RESET_HOLDING:
+        if (now >= a->reset_deadline) release_reset(a, now);
+        break;
+    case RESET_RELEASING:
+    case RESET_FAILED:
+        if (a->reset_mode == 0) {
+            a->reset_phase = RESET_IDLE;
+            a->unexpected_reset_reported = 0;
+            a->valid_after = lsl_local_clock() + a->settle_seconds; /* Settle restarts after release. */
+            gui_state(a, lsl_local_clock());
+        } else if (a->reset_phase == RESET_RELEASING && now >= a->reset_deadline) {
+            a->reset_phase = RESET_FAILED;
+            marker(a, "analog_reset_release_failed", lsl_local_clock());
+            gui_state(a, lsl_local_clock());
+        }
+        break;
+    default:
+        if (a->reset_mode != 0 && a->reset_mode != -999 && !a->unexpected_reset_reported) {
+            a->unexpected_reset_reported = 1;
+            marker(a, "analog_reset_unexpectedly_held", lsl_local_clock());
+            release_reset(a, now);
+        }
+    }
+}
+
+static void timestamps_reset(App *a)
+{
+    a->ts_k = 0;
+    a->ts_started = a->ts_fallback = 0;
+}
+
+/* Nominal-rate sample clock anchored to device packet_time; offset to LSL clock tracks the
+ * minimum receipt latency per packet (jitter only adds latency) and is slewed slowly. */
+static double sample_time(App *a, double packet_time, double now)
+{
+    unsigned long long k = a->ts_k++;
+    double fs = a->ts_fs, offset, target, delta;
+    if (a->ts_fallback) return now;
+    if (!isfinite(packet_time)) {
+        a->ts_fallback = 1;
+        marker(a, "timestamp_fallback", now);
+        return now;
+    }
+    if (!a->ts_started) {
+        a->ts_started = 1;
+        a->ts_offset = a->ts_window_min = a->ts_prev_window_min = now - packet_time;
+        a->ts_window_start = a->ts_base_pt = a->ts_last_pt = packet_time;
+        a->ts_base_k = k;
+        a->ts_packet_len = 0;
+    } else if (packet_time != a->ts_last_pt) {
+        double packet_duration = (a->ts_packet_len > 0 ? a->ts_packet_len : 1) / fs;
+        double expected = a->ts_base_pt + (double)(k - a->ts_base_k) / fs;
+        if (packet_time < a->ts_last_pt) {
+            a->ts_fallback = 1;
+            marker(a, "timestamp_fallback", now);
+            return now;
+        }
+        if (packet_time - expected > 1.5 * packet_duration) {
+            marker(a, "sample_gap", now);
+            a->ts_base_pt = packet_time;
+            a->ts_base_k = k;
+        }
+        offset = now - packet_time;
+        if (packet_time - a->ts_window_start >= TS_WINDOW_SECONDS) {
+            a->ts_prev_window_min = a->ts_window_min;
+            a->ts_window_min = offset;
+            a->ts_window_start = packet_time;
+        } else if (offset < a->ts_window_min) a->ts_window_min = offset;
+        target = a->ts_window_min < a->ts_prev_window_min ? a->ts_window_min : a->ts_prev_window_min;
+        delta = target - a->ts_offset;
+        if (delta > TS_MAX_SLEW_PER_PACKET) delta = TS_MAX_SLEW_PER_PACKET;
+        if (delta < -TS_MAX_SLEW_PER_PACKET) delta = -TS_MAX_SLEW_PER_PACKET;
+        a->ts_offset += delta;
+        a->ts_last_pt = packet_time;
+        a->ts_packet_len = 0;
+    }
+    ++a->ts_packet_len;
+    return a->ts_offset + a->ts_base_pt + (double)(k - a->ts_base_k) / fs;
 }
 
 static void on_sample(DSI_Headset h, double packet_time, void *userdata)
@@ -233,18 +372,16 @@ static void on_sample(DSI_Headset h, double packet_time, void *userdata)
     double now = lsl_local_clock();
     int i, ready;
     (void)h;
-    (void)packet_time; /* Preserve upstream receipt-time stamping; see README timing limitations. */
     if (!a->acquiring) return; /* Also discard trailing packets during a pause/shutdown. */
     ++a->sample_count;
     for (i = 0; i < a->channel_count; ++i)
         a->eeg_sample[i] = (float)DSI_Channel_GetSignal(a->channels[i]);
     if (DSI_Error()) { a->failed = 1; return; }
-    if (lsl_push_sample_ft(a->eeg, a->eeg_sample, now) != 0) a->failed = 1;
+    if (lsl_push_sample_ft(a->eeg, a->eeg_sample, sample_time(a, packet_time, now)) != 0) a->failed = 1;
 
     /* Poll estimates at 1 Hz. This is NOT an independent 1 Hz hardware sampler. */
     if (now >= a->next_impedance) {
-        ready = a->driver_mode == 1 && a->reset_mode == 0 &&
-                !a->command_pending && now >= a->valid_after;
+        ready = impedance_ready(a, now);
         for (i = 0; i < a->source_count; ++i)
             a->impedance_sample[i] = ready ? DSI_Source_GetImpedanceEEG(a->sources[i]) : NAN;
         a->impedance_sample[a->source_count] = ready ? DSI_Headset_GetImpedanceCMF(a->h) : NAN;
@@ -270,7 +407,7 @@ static int message(const char *text, int level)
 
 static lsl_streaminfo stream_info(App *a, const char *name, const char *type,
                                  int count, double rate, lsl_channel_format_t format,
-                                 const char *id, const char *group)
+                                 const char *id, const char *group, const char *timestamp_method)
 {
     lsl_streaminfo info = lsl_create_streaminfo(name, type, count, rate, format, id);
     lsl_xml_ptr desc;
@@ -285,7 +422,7 @@ static lsl_streaminfo stream_info(App *a, const char *name, const char *type,
     lsl_append_child_value(desc, "firmware_version", DSI_Headset_GetFirmwareRevision(a->h));
     lsl_append_child_value(desc, "dsi_api_version", DSI_GetAPIVersion());
     lsl_append_child_value(desc, "stream_group", group);
-    lsl_append_child_value(desc, "timestamp_method", "host_callback_receipt_lsl_local_clock");
+    lsl_append_child_value(desc, "timestamp_method", timestamp_method);
     lsl_append_child_value(desc, "impedance_test_frequencies_hz", "110,130");
     lsl_append_child_value(desc, "impedance_settle_seconds", settling);
     return info;
@@ -296,7 +433,7 @@ static void channel_metadata(lsl_xml_ptr channels, const char *label, const char
     lsl_xml_ptr ch = lsl_append_child(channels, "channel");
     lsl_append_child_value(ch, "label", label);
     lsl_append_child_value(ch, "type", type);
-    lsl_append_child_value(ch, "unit", unit);
+    if (unit) lsl_append_child_value(ch, "unit", unit); /* NULL: units unspecified, no unit element. */
 }
 
 static int init_streams(App *a, const char *name)
@@ -308,6 +445,7 @@ static int init_streams(App *a, const char *name)
     double rate = DSI_Headset_GetSamplingRate(a->h);
     a->channel_count = DSI_Headset_GetNumberOfChannels(a->h);
     if (check_dsi("Get channel counts") || total < 0 || a->channel_count <= 0 || rate <= 0) return -1;
+    a->ts_fs = rate;
     a->channels = (DSI_Channel *)calloc((size_t)a->channel_count, sizeof(*a->channels));
     a->sources = (DSI_Source *)calloc((size_t)total + 1, sizeof(*a->sources));
     a->eeg_sample = (float *)calloc((size_t)a->channel_count, sizeof(float));
@@ -321,23 +459,25 @@ static int init_streams(App *a, const char *name)
     for (i = 0; i < total; ++i) {
         DSI_Source s = DSI_Headset_GetSourceByIndex(a->h, (unsigned int)i);
         if (!s || check_dsi("Get electrode source")) return -1;
-        if (DSI_Source_IsReferentialEEG(s) && !DSI_Source_IsFactoryReference(s))
+        if (DSI_BOOL(DSI_Source_IsReferentialEEG(s)) && !DSI_BOOL(DSI_Source_IsFactoryReference(s)))
             a->sources[a->source_count++] = s;
     }
     if (strlen(name) > 180) { fprintf(stderr, "Stream name is too long\n"); return -1; }
     snprintf(group, sizeof(group), "WearableSensing-%u-%s", DSI_Headset_GetSerialNumber(a->h), name);
     snprintf(id, sizeof(id), "%s-eeg", group);
-    info = stream_info(a, name, "EEG", a->channel_count, rate, cft_float32, id, group);
+    info = stream_info(a, name, "EEG", a->channel_count, rate, cft_float32, id, group,
+                       "nominal_rate_anchored_to_packet_time");
     if (!info) return -1;
     desc = lsl_get_desc(info);
     lsl_append_child_value(desc, "reference", DSI_Headset_GetReferenceString(a->h));
     channels = lsl_append_child(desc, "channels");
     for (i = 0; i < a->channel_count; ++i) {
         DSI_Channel c = a->channels[i];
-        int trigger = DSI_Channel_IsTrigger(c);
+        int trigger = DSI_BOOL(DSI_Channel_IsTrigger(c));
+        int eeg = DSI_BOOL(DSI_Channel_IsReferentialEEG(c));
         channel_metadata(channels, DSI_Channel_GetName(c),
-                         trigger ? "Trigger" : (DSI_Channel_IsReferentialEEG(c) ? "EEG" : "Auxiliary"),
-                         trigger ? "integer" : (DSI_Channel_IsReferentialEEG(c) ? "microvolts" : "vendor_units"));
+                         trigger ? "Trigger" : (eeg ? "EEG" : "Auxiliary"),
+                         trigger ? "integer" : (eeg ? "microvolts" : "vendor_units"));
         /* Store the full montage expression without modifying API-owned strings. */
         lsl_append_child_value(lsl_last_child(channels), "montage", DSI_Channel_GetString(c));
     }
@@ -348,24 +488,29 @@ static int init_streams(App *a, const char *name)
     snprintf(id, sizeof(id), "%s-impedance", group);
     snprintf(imp_name, sizeof(imp_name), "%s-Impedance", name);
     /* Irregular rate: no samples when EEG stops, no invented samples after stalls. */
-    info = stream_info(a, imp_name, "Impedance", a->source_count + 1, 0, cft_double64, id, group);
+    info = stream_info(a, imp_name, "Impedance", a->source_count + 1, 0, cft_double64, id, group,
+                       "host_callback_receipt_lsl_local_clock");
     if (!info) return -1;
     desc = lsl_get_desc(info);
     lsl_append_child_value(desc, "poll_interval_seconds", "1");
     lsl_append_child_value(desc, "invalid_value", "NaN: off, resetting, settling, negative or nonfinite API estimate");
     lsl_append_child_value(desc, "measurement", "physical_sources_not_montage_channels");
+    lsl_append_child_value(desc, "cmf_note", "Common-mode follower reading; units unspecified by the cited documentation.");
     channels = lsl_append_child(desc, "channels");
     for (i = 0; i < a->source_count; ++i)
         channel_metadata(channels, DSI_Source_GetName(a->sources[i]), "Impedance", "ohms");
     snprintf(cmf_label, sizeof(cmf_label), "CMF=%s", DSI_Headset_GetFactoryReferenceString(a->h));
-    channel_metadata(channels, cmf_label, "Impedance", "ohms");
+    channel_metadata(channels, cmf_label, "CommonModeFollower", NULL);
+    lsl_append_child_value(lsl_last_child(channels), "description",
+                           "Common-mode follower reading; units unspecified by the cited documentation.");
     a->impedance = lsl_create_outlet(info, 0, 360);
     lsl_destroy_streaminfo(info);
     if (!a->impedance) return -1;
 
     snprintf(id, sizeof(id), "%s-impedance-markers", group);
     snprintf(marker_name, sizeof(marker_name), "%s-ImpedanceMarkers", name);
-    info = stream_info(a, marker_name, "Markers", 1, 0, cft_string, id, group);
+    info = stream_info(a, marker_name, "Markers", 1, 0, cft_string, id, group,
+                       "host_callback_receipt_lsl_local_clock");
     if (!info) return -1;
     desc = lsl_get_desc(info);
     lsl_append_child_value(desc, "state_semantics", "API observed modes, not sample-exact hardware transitions; 0=off, 1=on, other=unknown/unsupported");
@@ -389,6 +534,7 @@ static int start_acquisition(App *a)
         marker(a, "acquisition_start_failed", lsl_local_clock());
         return -1;
     }
+    timestamps_reset(a); /* Sample index k restarts with every acquisition. */
     a->acquiring = 1;
     a->next_impedance = a->next_snapshot = 0;
     marker(a, "acquisition_started", lsl_local_clock());
@@ -491,20 +637,26 @@ static void help(const char *program)
         "  --lsl-stream-name=NAME      EEG stream name (default: WS-default)\n"
         "  --impedance=off|on         Startup driver state (default: off)\n"
         "  --impedance-settle=SECONDS Suppress estimates after transitions (default: 2)\n"
+        "  --reset-hold=SECONDS       Analog reset hold before automatic release (default: 1)\n"
         "  --dsi-library=PATH         Override bundled DSI shared library\n"
         "  --check-libraries          Load DSI/LSL and report versions, without connecting\n"
         "  --gui-telemetry            Emit DSI_GUI JSON records on stdout (GUI integration)\n"
         "  --auto-start               Start acquisition immediately (default: wait for start)\n"
         "Runtime stdin commands + Enter: start, stop, on/i, off/o, reset/r, status/s, quit/q\n"
-        "Creates EEG, NAME-Impedance (ohms), NAME-ImpedanceMarkers streams.\n"
+        "Creates EEG, NAME-Impedance (electrodes ohms; CMF = common-mode follower, raw, units unspecified), NAME-ImpedanceMarkers streams.\n"
         "Default: advertise all outlets, then wait for start; stop keeps outlets alive.\n"
-        "EEG remains unfiltered. Reset is an analog amplifier reset, not impedance calibration.\n", program);
+        "EEG remains unfiltered. Reset is an analog amplifier reset, not impedance calibration:\n"
+        "  reset starts it, holds --reset-hold seconds, releases it and waits up to 3 s for mode 0;\n"
+        "  impedance settle restarts after release. Any held reset is released on connect.\n"
+        "EEG timestamps: nominal rate anchored to DSI packet_time, slowly corrected to the LSL\n"
+        "  clock by minimum receipt latency; gaps re-anchor (sample_gap marker), non-monotonic\n"
+        "  packet_time falls back to receipt time (timestamp_fallback marker).\n", program);
 }
 
 int main(int argc, const char *argv[])
 {
     App a = {0};
-    const char *name, *imp, *settle, *verbosity, *library;
+    const char *name, *imp, *settle, *hold, *verbosity, *library;
     char *end;
     long level = 2;
     int result = 1, connected = 0, load;
@@ -522,6 +674,14 @@ int main(int argc, const char *argv[])
         errno = 0; a.settle_seconds = strtod(settle, &end);
         if (end == settle || *end || errno || !isfinite(a.settle_seconds) || a.settle_seconds < 0) {
             fprintf(stderr, "Invalid --impedance-settle\n"); return 1;
+        }
+    }
+    a.reset_hold_seconds = 1.0;
+    hold = option(argc, argv, "reset-hold", NULL);
+    if (hold) {
+        errno = 0; a.reset_hold_seconds = strtod(hold, &end);
+        if (end == hold || *end || errno || !isfinite(a.reset_hold_seconds) || a.reset_hold_seconds < 0) {
+            fprintf(stderr, "Invalid --reset-hold\n"); return 1;
         }
     }
     verbosity = option(argc, argv, "verbosity", "v");
@@ -559,6 +719,7 @@ int main(int argc, const char *argv[])
     /* Ensure a previously active headset cannot feed data during preparation. */
     DSI_Headset_StopDataAcquisition(a.h);
     if (check_dsi("Ensure acquisition is stopped")) goto cleanup;
+    clear_reset_on_connect(&a);
     DSI_Headset_ChooseChannels(a.h, option(argc, argv, "montage", "m"),
                              option(argc, argv, "reference", "r"), 1);
     if (check_dsi("Configure montage") || init_streams(&a, name)) goto cleanup;
@@ -574,6 +735,7 @@ int main(int argc, const char *argv[])
     if (option(argc, argv, "auto-start", NULL) && start_acquisition(&a)) goto cleanup;
     while (keep_running && !a.failed) {
         if (poll_commands(&a) || observe_state(&a)) { a.failed = 1; break; }
+        reset_tick(&a, lsl_local_clock());
         if (!keep_running) break;
         DSI_Headset_Idle(a.h, 0.01);
         if (check_dsi("Receive samples")) { a.failed = 1; break; }

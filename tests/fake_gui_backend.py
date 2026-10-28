@@ -5,6 +5,8 @@ import sys
 import threading
 import time
 
+HOLD_SECONDS, RELEASE_SECONDS, SETTLE_SECONDS = 0.3, 0.2, 0.2
+
 
 def emit(kind, **fields):
     print("DSI_GUI " + json.dumps({"protocol": 1, "type": kind, **fields}), flush=True)
@@ -34,6 +36,7 @@ def main():
     count = 0
     started = time.monotonic()
     next_update = 0.0
+    reset_mode, phase, phase_until, settled = 0, "idle", 0.0, 0.0
     while True:
         try:
             command = commands.get(timeout=0.02)
@@ -54,23 +57,38 @@ def main():
             acquiring = False
             driver = 0
             emit("event", event="acquisition_stopped")
-        if command in ("on", "off", "reset"):
-            prefix = "analog_reset" if command == "reset" else f"impedance_{command}"
-            emit("event", event=f"{prefix}_requested")
-            if command in ("on", "off"):
-                driver = int(command == "on")
-            emit("event", event=f"{prefix}_command_returned")
-            if command == "reset":
-                emit("event", event="analog_reset_state mode=1")
-                emit("event", event="analog_reset_state mode=0")
+        if command in ("on", "off"):
+            emit("event", event=f"impedance_{command}_requested")
+            driver = int(command == "on")
+            emit("event", event=f"impedance_{command}_command_returned")
         now = time.monotonic()
+        if command == "reset":
+            # Mirror the real backend: hold, release, confirm mode 0 (or fail when stuck), then settle.
+            emit("event", event="analog_reset_requested")
+            reset_mode, phase, phase_until = 1, "holding", now + HOLD_SECONDS
+            emit("event", event="analog_reset_started")
+            emit("event", event="analog_reset_state mode=1")
+            next_update = 0.0
+        elif phase == "holding" and now >= phase_until:
+            phase, phase_until = "releasing", now + RELEASE_SECONDS
+            emit("event", event="analog_reset_released")
+            next_update = 0.0
+        elif phase == "releasing" and now >= phase_until:
+            if options.get("port") == "SIM_RESET_STUCK":
+                phase = "failed"
+                emit("event", event="analog_reset_release_failed")
+            else:
+                reset_mode, phase, settled = 0, "idle", now + SETTLE_SECONDS
+                emit("event", event="analog_reset_state mode=0")
+            next_update = 0.0
         if now >= next_update:
             if acquiring:
                 count += 30
-            emit("state", timestamp=now, driver_mode=driver, reset_mode=0,
-                 requested_on=driver, command_pending=0, impedance_ready=int(acquiring and driver), sample_count=count,
+            ready = int(acquiring and driver and phase == "idle" and now >= settled)
+            emit("state", timestamp=now, driver_mode=driver, reset_mode=reset_mode, reset_phase=phase,
+                 requested_on=driver, command_pending=0, impedance_ready=ready, sample_count=count,
                  acquiring=int(acquiring), eeg_subscribers=0, impedance_subscribers=0, marker_subscribers=0,
-                 impedance_timestamp=now, impedance=[123000, 456000] if driver else [None, None])
+                 impedance_timestamp=now, impedance=[123000, 456000] if ready else [None, None])
             next_update = now + 0.1
         if options.get("port") == "SIM_EXIT" and now - started > 0.3:
             return 0

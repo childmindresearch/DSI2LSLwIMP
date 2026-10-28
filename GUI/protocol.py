@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 
 PREFIX = "DSI_GUI "
+RESET_PHASES = ("idle", "holding", "releasing", "failed")
 
 
 @dataclass
@@ -68,6 +69,9 @@ def decode_record(line: str) -> dict | None:
         for key in ("driver_mode", "reset_mode", "requested_on", "command_pending", "impedance_ready", "sample_count"):
             if type(record.get(key)) is not int:
                 raise ValueError(f"Invalid state field: {key}")
+        # Older backends omit reset_phase; treat as idle but reject unknown values.
+        if record.setdefault("reset_phase", "idle") not in RESET_PHASES:
+            raise ValueError("Invalid state field: reset_phase")
         if record["sample_count"] < 0:
             raise ValueError("Invalid sample count.")
         values = record.get("impedance")

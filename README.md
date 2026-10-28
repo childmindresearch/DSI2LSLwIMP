@@ -73,12 +73,14 @@ All three outlets are created at startup, regardless of whether impedance is ena
 | Name (default) | Type / format | Contents |
 | --- | --- | --- |
 | `WS-default` | EEG / float32, headset sampling rate | Existing configured montage, including triggers/auxiliary channels if selected. No new filtering or impedance subtraction. |
-| `WS-default-Impedance` | Impedance / double64, irregular | One value per physical referential EEG source, excluding the virtual factory-reference source, followed by `CMF=<factory reference>`. Units: ohms. Polled approximately once per second while EEG samples arrive. |
+| `WS-default-Impedance` | Impedance / double64, irregular | One value per physical referential EEG source, excluding the virtual factory-reference source, followed by `CMF=<factory reference>`. Electrode estimates are ohms; CMF is the raw common-mode follower reading, units unspecified (no `unit` element). Polled approximately once per second while EEG samples arrive. |
 | `WS-default-ImpedanceMarkers` | Markers / one string channel, irregular | Command requests, command returns/failures, API-observed mode changes, acquisition lifecycle, and state snapshots approximately once per second. |
 
-The impedance layout deliberately does **not** mirror the EEG montage: `F3-F4` has no single physical-electrode impedance. Linked ears/mastoids are included when the API exposes them as referential sources. CMF is read through the vendor's separate `DSI_Headset_GetImpedanceCMF()` getter. This matches the selection logic in `DSI_API/demo.c`.
+The impedance layout deliberately does **not** mirror the EEG montage: `F3-F4` has no single physical-electrode impedance. Linked ears/mastoids are included when the API exposes them as referential sources. CMF is read through the vendor's separate `DSI_Headset_GetImpedanceCMF()` getter and is a raw common-mode follower (CMF) reading: `DSI_API/demo.c` describes "the common-mode follower (CMF) sensor, at the factory reference position" as a special case. Its channel type is `CommonModeFollower` and the cited documentation does not specify its units, so the stream omits a unit. This matches the selection logic in `DSI_API/demo.c` and the vendor's C/Python impedance tutorials.
 
 Impedance values are `NaN` when the driver is off/unknown, during an analog reset, during the configurable settling period, while a command is executing, or for negative/nonfinite API estimates. They are **not** filled with stale last-known impedances or misleading zeroes. NaN does not distinguish these causes; use the marker stream. Finite estimates are not a guarantee of good contact or of a newly recomputed hardware measurement.
+
+The API returns physical-electrode estimates in ohms. The GUI displays these in kΩ and rates contact using the vendor tutorial thresholds: below 1 MΩ Good, 1–2 MΩ Fair, and 2 MΩ or more Poor. Wait approximately 2 seconds after enabling impedance or releasing reset before reading estimates. The separate CMF getter returns the common-mode follower reading, published raw with units unspecified. The vendor tutorials print it as `Common-mode fault: %.1f` with no units; that label/omission does not establish the value is dimensionless, and we likewise do not claim it is ohms. Electrode contact thresholds do not apply to it. These are contact indicators, not EEG-quality guarantees. See the vendor [C](https://support.wearablesensing.com/api/getting_started/start_c.html#task-check-impedances) and [Python](https://support.wearablesensing.com/api/getting_started/start_python.html) tutorials.
 
 XML metadata includes physical channel labels, units, hardware/firmware/API identity, settling time, timestamp method, and a shared `stream_group`. Stream source IDs are based on device serial number and stream name; use different stream names for simultaneous devices if serial identity is unavailable. Do not put participant-identifying information in stream names. EEG labels now use the API channel name and preserve the full montage expression in metadata without modifying API-owned strings.
 
@@ -140,11 +142,19 @@ Type a command followed by **Enter** while streaming:
 | `stop` | Disable impedance and pause acquisition; keep all outlets and subscriptions alive. |
 | `on` or `i` | Send `DSI_Headset_StartImpedanceDriver()`. EEG acquisition continues. |
 | `off` or `o` | Send `DSI_Headset_StopImpedanceDriver()`. EEG acquisition continues; impedance becomes NaN. |
-| `reset` or `r` | Send the one-shot `DSI_Headset_StartAnalogReset()`. This resets the analog amplifier, **not** an impedance calibration routine. |
+| `reset` or `r` | Start the analog-reset sequence: call `DSI_Headset_StartAnalogReset()`, hold, then call `DSI_Headset_ReleaseAnalogReset()`. This resets the analog amplifier, **not** an impedance calibration routine. |
 | `status` or `s` | Publish/print the cached API-observed state. |
 | `quit` or `q`, Ctrl+C | Disable impedance, stop acquisition and release resources. |
 
-`--impedance-settle=2` is the default estimate-suppression period after commands and observed state changes. It is a conservative starting value from the vendor tutorial, not a validated universal recovery time. It does not mask/drop EEG samples or certify EEG as clean after two seconds. Repeated `on` restarts the suppression period. To cycle just the impedance driver, issue `off`, check `status`, then `on`; this is distinct from analog reset. A command failure stops the acquisition loop and triggers best-effort shutdown.
+`--impedance-settle=2` is the default estimate-suppression period after commands and observed state changes, including reset release. It is a conservative starting value from the vendor tutorial, not a validated universal recovery time. It does not mask/drop EEG samples or certify EEG as clean after two seconds. Repeated `on` restarts the suppression period. To cycle just the impedance driver, issue `off`, check `status`, then `on`; this is distinct from analog reset. A command failure stops the acquisition loop and triggers best-effort shutdown.
+
+### Analog reset
+
+`reset` starts the SDK analog-reset sequence; it is not an impedance calibration. The backend emits `analog_reset_requested`, calls `DSI_Headset_StartAnalogReset()` and emits `analog_reset_started` when the call returns successfully. It holds reset for `--reset-hold=SECONDS` (default 1.0), then calls `DSI_Headset_ReleaseAnalogReset()` and emits `analog_reset_released`. The API-observed `reset_mode` is 1 while reset is held and 0 when released. While `reset_mode` is nonzero, impedance is unavailable (`NaN`); the state and periodic `state ... reset_phase=` markers report `holding`, `releasing`, `failed`, or `idle`.
+
+After release the backend polls `DSI_Headset_GetAnalogResetMode()` for up to 3 seconds. A return to mode 0 completes the reset and restarts the 2-second impedance settling period. If mode remains nonzero, the backend emits `analog_reset_release_failed`, marks the phase failed, and continues acquisition; reconnect to recover, or the backend returns to idle if the mode later becomes 0. On connect, the backend calls Release once (`analog_reset_cleared_on_connect`). If reset is unexpectedly held while idle, it emits `analog_reset_unexpectedly_held` once and makes one release attempt. `LockAnalogReset` is never called.
+
+These semantics follow the supplied SDK's `DSI.h:204-206` and changelog: version 1.3.0 describes Lock/Release as the start/end of a contact-optimization session during which signals are invalid, and version 1.6.2 notes analog-reset locks are released during initialization. The [vendor C](https://support.wearablesensing.com/api/getting_started/start_c.html) and [Python](https://support.wearablesensing.com/api/getting_started/start_python.html) tutorials do not cover analog reset.
 
 Commands and acquisition run on the same thread; serial commands are never issued from the sample callback or a competing hardware-control thread. Stdin is nonblocking: terminals and subprocess pipes work on both macOS and Windows. Closing stdin does not stop streaming. In the Windows console the app collects characters until Enter; redirected disk files are not supported as a control channel. The new Qt GUI in `GUI/` drives these commands through the subprocess's stdin and uses optional `--gui-telemetry` JSON stdout records to display state and impedance without accessing the headset itself.
 
@@ -158,7 +168,7 @@ Existing options remain: `--port`, `--montage`, `--reference`, `--verbosity`, `-
 * The vendor signal-quality guide states that enabling impedance **injects a test signal into the data**. This is not just additional passive telemetry.
 * Impedances are associated with physical sources, not re-referenced montage channels. Their API estimates are derived while signal acquisition is running.
 * The demo waits one second before reading; the public API quick reference/tutorial recommends roughly **two seconds**. The demo also says to plot readings and verify they reach a plateau before averaging.
-* The SDK warns that **locking analog reset invalidates signal data**. This program does not lock it. A brief one-shot reset can still create a disturbed interval.
+* The SDK warns that **locking analog reset invalidates signal data**. This program does not lock it. The Start→hold→Release sequence can still create a disturbed interval; see [Analog reset](#analog-reset).
 
 ### Analysis implications (recommendations, not a vendor guarantee)
 
@@ -177,15 +187,24 @@ impedance_on_requested
 impedance_on_command_returned
 impedance_state mode=1
 analog_reset_requested
-analog_reset_command_returned
+analog_reset_started
 analog_reset_state mode=1
+analog_reset_released
 analog_reset_state mode=0
-state driver_mode=1 reset_mode=0 requested_on=1 command_pending=0 impedance_ready=1
+state driver_mode=1 reset_mode=0 reset_phase=idle requested_on=1 command_pending=0 impedance_ready=1
 ```
 
-`*_requested` is emitted **before** the serial API call; `*_command_returned` means it returned without a DSI error, not that a sample-exact edge was measured. `*_state` comes from changes in the API getters. Normal mode conventions are 0=off and 1=on; raw other modes are recorded and treated conservatively as not ready. Very short reset states can occur entirely within a blocking command, so an observed on/off pair is not guaranteed. The request/return markers still record the operation. Confirm conventions on the target firmware.
+`*_requested` is emitted **before** the serial API call; `analog_reset_started` and `analog_reset_released` record successful command returns, not sample-exact hardware edges. `*_state` comes from changes in the API getters. Normal mode conventions are 0=off and 1=on; raw other modes are recorded and treated conservatively as not ready. Very short reset states can occur entirely within a blocking command, so an observed on/off pair is not guaranteed. The request and command markers still record the operation. Confirm conventions on the target firmware. Reset release failure and recovery markers are described above.
 
-Markers use the LSL host clock. EEG preserves upstream **host callback receipt timestamps**, now explicitly stamped; impedance uses the same receipt timestamp as the triggering EEG callback. Device `packet_time` is not mapped to LSL time. Bluetooth buffering, hardware anti-alias filter delay, synchronous serial commands, and the 10 ms acquisition-loop polling interval prevent sample-exact alignment between a command and affected EEG. Offline clock synchronization cannot remove those device/transport delays. Use both request/return and state markers plus a measured safety margin when annotating; do not interpret `impedance_ready` as EEG artifact-free. Periodic snapshots let a recorder started late learn the current state, but do not recover earlier transitions.
+### EEG timestamps
+
+EEG timestamps use `nominal_rate_anchored_to_packet_time`: each sample is placed at `offset + base_packet_time + (k−base_k)/fs`, using the vendor packet timestamp and nominal sampling rate. The LSL offset is the minimum `receipt_lsl − packet_time` observed per packet over approximately 10-second windows, slewed by at most 0.05 ms per packet. A packet-time jump larger than 1.5 packet durations emits `sample_gap` and re-anchors. Non-monotonic or non-finite packet timestamps emit `timestamp_fallback` once and use receipt timestamps thereafter. Impedance and marker streams continue to use `host_callback_receipt_lsl_local_clock`; impedance samples use the receipt time of the triggering EEG callback. This method does not correct drift between nominal sampling rate and the device clock.
+
+Markers use the LSL host clock. Bluetooth buffering, hardware anti-alias filter delay, synchronous serial commands, and the 10 ms acquisition-loop polling interval prevent sample-exact alignment between a command and affected EEG. Offline clock synchronization cannot remove those device/transport delays. Use request/return and state markers plus a measured safety margin when annotating; do not interpret `impedance_ready` as EEG artifact-free. Periodic snapshots let a recorder started late learn the current state, but do not recover earlier transitions.
+
+### Legacy recordings
+
+Load XDF recordings with `pyxdf.load_xdf(..., dejitter_timestamps=True)` to apply pyxdf's timestamp dejittering. Recordings made before these fixes have Trigger-typed EEG metadata (all EEG channels were typed as Trigger), impedance stuck at NaN after any reset, and CMF previously mislabeled as ohms. Interpret their channel types and CMF values accordingly; these metadata/value issues cannot be repaired merely by loading with dejittering.
 
 In LabRecorder, record **all three streams** into the same XDF. Confirm the impedance and marker streams contain samples (not just names) before the experiment. A final shutdown marker is best-effort; network delivery after immediately destroying outlets is not guaranteed.
 
@@ -197,7 +216,7 @@ Tests in `tests/test_impedance.c` use fake DSI getters/commands with **real libl
 
 * [Upstream App-WearableSensing](https://github.com/labstreaminglayer/App-WearableSensing) — existing EEG bridge and exclusive serial-port access.
 * Supplied `DSI_API/demo.c`, sections 2.3.1, 2.4 and `ImpedanceDemo`; supplied `DSI.h` analog-reset functions — physical source selection, callback behavior, 110/130 Hz injection and reset warning.
-* [Vendor API quick reference](https://support.wearablesensing.com/api/quick_reference.html) and [C tutorial, Check Impedances](https://support.wearablesensing.com/api/getting_started/start_c.html#task-check-impedances) — controls, settling guidance, ohm-to-kilohm conversion.
+* [Vendor API quick reference](https://support.wearablesensing.com/api/quick_reference.html), [C tutorial, Check Impedances](https://support.wearablesensing.com/api/getting_started/start_c.html#task-check-impedances), and [Python tutorial](https://support.wearablesensing.com/api/getting_started/start_python.html) — controls, packet timestamps, impedance ohms/kilohms and thresholds, settling guidance, and the CMF print (labelled "Common-mode fault" without units). `DSI_API/demo.c` identifies CMF as the common-mode follower. The tutorials do not document analog reset.
 * [Vendor signal-quality guide](https://support.wearablesensing.com/faq/software/questions/signal-quality-dsi-streamer.html) — injected signal and dry-electrode impedance guidance.
 * [Vendor LSL GUI documentation](https://support.wearablesensing.com/examples/lsl/gui.html) — Reset is an analog amplifier reset; recent vendor GUI versions already offer an impedance startup checkbox, but this does not establish a separate impedance-values/markers stream.
 * [liblsl v1.17.7](https://github.com/sccn/liblsl/releases/tag/v1.17.7) — current latest stable release checked during this work (2026-10-14).
