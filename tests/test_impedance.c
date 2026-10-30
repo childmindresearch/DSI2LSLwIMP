@@ -22,10 +22,12 @@ static DSI_Channel channel(DSI_Headset h, unsigned int i) { (void)h; return &cha
 static DSI_Source source(DSI_Headset h, unsigned int i) { (void)h; return &source_storage[i]; }
 static const char *channel_name(DSI_Channel c) { return c == channel_storage ? "F3" : "TRG"; }
 static const char *channel_expression(DSI_Channel c) { return c == channel_storage ? "F3-Pz" : "TRG"; }
-/* Real library returns garbage upper bytes in bool_t; only the low byte is meaningful. */
+/* Deliberately set upper bits to exercise the hypothesized bool_t low-byte workaround (DSI.py uses c_bool,
+   DSI.h uses int). The actual Windows library ABI is unverified. */
 static int is_trigger(DSI_Channel c) { return c == &channel_storage[1] ? 0x12345601 : 0x12345600; }
 static int is_eeg_channel(DSI_Channel c) { return c == channel_storage ? 0x7F000001 : 0x7F000000; }
-static double signal_value(DSI_Channel c) { return c == channel_storage ? 42 : 7; }
+static double fake_signal[2] = {42, 7};
+static double signal_value(DSI_Channel c) { return fake_signal[c == channel_storage ? 0 : 1]; }
 static int is_eeg_source(DSI_Source s) { return s != &source_storage[2]; }
 static int is_factory(DSI_Source s) { return s == &source_storage[1]; }
 static const char *source_name(DSI_Source s) { (void)s; return "F3"; }
@@ -81,8 +83,7 @@ static void expect_next_marker(lsl_inlet inlet, const char *expected)
         char *text = NULL;
         int skip, match;
         REQUIRE(lsl_pull_sample_str(inlet, &text, 1, 5, &error) > 0 && error == 0);
-        skip = !strncmp(text, "state ", 6) || !strncmp(text, "impedance_state", 15) ||
-               !strcmp(text, "sample_gap"); /* Test packet_times are arbitrary. */
+        skip = !strncmp(text, "state ", 6) || !strncmp(text, "impedance_state", 15);
         match = !strcmp(text, expected);
         if (!skip && !match) fprintf(stderr, "unexpected marker: %s (wanted %s)\n", text, expected);
         lsl_destroy_string(text);
@@ -98,35 +99,69 @@ static void drain(lsl_inlet inlet)
     while (lsl_pull_sample_str(inlet, &text, 1, 0.2, &error) > 0) { lsl_destroy_string(text); text = NULL; }
 }
 
-static void test_timestamps(App *a, lsl_inlet marker_inlet)
+static void drain_eeg(lsl_inlet inlet)
 {
-    double t, prev = 0, pt = 1000.0, base = 50.0;
-    int p, j, n = 0;
-    const double fs = 300, jitter[] = {0.004, 0.0, 0.012, 0.001, 0.020, 0.003};
-    a->ts_fs = fs;
-    timestamps_reset(a);
-    drain(marker_inlet);
-    /* 9 samples share packet_time, all delivered with one jittered receipt time. */
-    for (p = 0; p < 200; ++p, pt += 9 / fs) {
-        double receipt = base + pt + 9 / fs + jitter[p % 6];
-        for (j = 0; j < 9; ++j, ++n) {
-            t = sample_time(a, pt, receipt);
-            if (n) REQUIRE(fabs((t - prev) - 1 / fs) < 0.0001 && t > prev);
-            prev = t;
-        }
+    int error = 0;
+    float v[2];
+    while (lsl_pull_sample_f(inlet, v, 2, 0.2, &error) > 0) {}
+}
+
+/* One callback must publish exactly the original conversion, (float)GetSignal per channel,
+ * stamped implicitly by LSL at push time: within [before, after] of the callback, never later. */
+static double expect_eeg(App *a, lsl_inlet inlet, double packet_time, double v0, double v1)
+{
+    int error = 0;
+    float got[2];
+    double before, after, ts;
+    fake_signal[0] = v0; fake_signal[1] = v1;
+    before = lsl_local_clock();
+    on_sample(a->h, packet_time, a);
+    after = lsl_local_clock();
+    ts = lsl_pull_sample_f(inlet, got, 2, 5, &error);
+    REQUIRE(error == 0 && ts >= before && ts <= after);
+    REQUIRE(memcmp(&got[0], &(float){(float)v0}, sizeof(float)) == 0);
+    REQUIRE(memcmp(&got[1], &(float){(float)v1}, sizeof(float)) == 0);
+    return ts;
+}
+
+static void expect_no_eeg(lsl_inlet inlet)
+{
+    int error = 0;
+    float v[2];
+    REQUIRE(lsl_pull_sample_f(inlet, v, 2, 0.2, &error) == 0); /* No synthetic samples. */
+}
+
+/* Only periodic state/impedance snapshots may appear: no timing events are fabricated. */
+static void expect_no_timing_markers(lsl_inlet inlet)
+{
+    int error = 0;
+    char *text = NULL;
+    while (lsl_pull_sample_str(inlet, &text, 1, 0.3, &error) > 0) {
+        REQUIRE(!strncmp(text, "state ", 6) || !strncmp(text, "impedance_state", 15));
+        lsl_destroy_string(text);
+        text = NULL;
     }
-    REQUIRE(!a->ts_fallback);
-    /* Gap: 3 packets missing. */
-    pt += 3 * 9 / fs;
-    t = sample_time(a, pt, base + pt + 9 / fs);
-    REQUIRE(t - prev > 3 * 9 / fs);
-    expect_marker(marker_inlet, "sample_gap");
-    /* Non-monotonic packet_time: receipt time from then on. */
-    REQUIRE(sample_time(a, pt - 1, 77.0) == 77.0 && a->ts_fallback);
-    REQUIRE(sample_time(a, pt + 1, 78.0) == 78.0);
-    expect_marker(marker_inlet, "timestamp_fallback");
-    timestamps_reset(a);
-    REQUIRE(!a->ts_fallback && a->ts_k == 0);
+}
+
+static void test_timestamps(App *a, lsl_inlet eeg_inlet, lsl_inlet marker_inlet)
+{
+    /* Equal (9-sample burst), repeated, backwards, skipped, and nonfinite packet_time. */
+    const double pts[] = {1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+                          999, 999, 1000.5, 0, -5, NAN, INFINITY, -INFINITY, 1001, 1001};
+    const double values[][2] = {{-12345.678, 0.1}, {1.0e6 + 0.3, -1.0e6 - 0.7}, {-0.0, 3.0e38},
+                                {65535, -32768.25}, {1e-30, -1e-30}};
+    double prev = 0, ts;
+    size_t i, n = sizeof(pts) / sizeof(pts[0]);
+    drain_eeg(eeg_inlet);
+    drain(marker_inlet);
+    for (i = 0; i < n; ++i) {
+        ts = expect_eeg(a, eeg_inlet, pts[i], values[i % 5][0], values[i % 5][1]);
+        REQUIRE(ts >= prev); /* Host push time never runs backwards, ignoring packet_time. */
+        prev = ts;
+    }
+    expect_no_eeg(eeg_inlet);
+    expect_no_timing_markers(marker_inlet);
+    fake_signal[0] = 42; fake_signal[1] = 7;
 }
 
 static void expect_marker(lsl_inlet inlet, const char *expected)
@@ -219,7 +254,7 @@ int main(void)
                         "Common-mode follower reading; units unspecified by the cited documentation."));
         REQUIRE(!strcmp(channel_child(a.impedance, 1, "unit", v, sizeof v), "")); /* No unit element. */
         info = lsl_get_info(a.eeg);
-        REQUIRE(!strcmp(lsl_child_value_n(lsl_get_desc(info), "timestamp_method"), "nominal_rate_anchored_to_packet_time"));
+        REQUIRE(!strcmp(lsl_child_value_n(lsl_get_desc(info), "timestamp_method"), "lsl_host_push_time"));
         lsl_destroy_streaminfo(info);
     }
     /* Connect with a reset left held: released once and confirmed by the main-loop tick. */
@@ -271,10 +306,17 @@ int main(void)
         reset_tick(&a, t0 + 0.5); /* Still holding. */
         REQUIRE(release_calls == releases && fake_reset == 1);
         a.valid_after = 0; a.next_impedance = 0;
-        on_sample(a.h, 0.3, &a);
+        drain_eeg(eeg_inlet);
+        /* Reset transients pass unaltered while impedance is unavailable. */
+        expect_eeg(&a, eeg_inlet, 0.3, -400000.5, 1.0e6 + 0.3);
         REQUIRE(isnan(a.impedance_sample[0]));
         reset_tick(&a, t0 + 1.1 + (lsl_local_clock() - t0));
         REQUIRE(release_calls == releases + 1 && a.reset_phase == RESET_RELEASING);
+        a.next_impedance = 0;
+        expect_eeg(&a, eeg_inlet, 0.3, 250000.25, -3.0e7);
+        REQUIRE(isnan(a.impedance_sample[0]));
+        expect_no_eeg(eeg_inlet);
+        fake_signal[0] = 42; fake_signal[1] = 7;
         REQUIRE(observe_state(&a) == 0 && a.reset_mode == 0);
         reset_tick(&a, lsl_local_clock());
         REQUIRE(a.reset_phase == RESET_IDLE && a.valid_after > lsl_local_clock());
@@ -349,7 +391,7 @@ int main(void)
         REQUIRE(command(&a, "start") == 0 && a.acquiring && adc_starts == 2);
         REQUIRE(a.eeg == original_eeg && a.impedance == original_impedance && a.markers == original_markers);
     }
-    test_timestamps(&a, marker_inlet);
+    test_timestamps(&a, eeg_inlet, marker_inlet);
     DSI_Headset_StartImpedanceDriver = fail_driver;
     REQUIRE(command(&a, "on") != 0 && a.driver_mode == 0 && isinf(a.valid_after));
     expect_marker(marker_inlet, "impedance_command_failed");

@@ -41,19 +41,14 @@ typedef struct {
     /* Analog reset: hold, then release, then confirm mode 0 (main loop only). */
     int reset_phase, unexpected_reset_reported;
     double reset_hold_seconds, reset_deadline;
-    /* EEG timestamps: t = offset + base_packet_time + (k - base_k) / fs. */
-    double ts_fs, ts_offset, ts_base_pt, ts_last_pt, ts_window_start, ts_window_min, ts_prev_window_min;
-    unsigned long long ts_k, ts_base_k;
-    int ts_packet_len, ts_started, ts_fallback;
 } App;
 
 enum { RESET_IDLE, RESET_HOLDING, RESET_RELEASING, RESET_FAILED };
 static const char *const reset_phase_names[] = { "idle", "holding", "releasing", "failed" };
 #define RESET_CONFIRM_SECONDS 3.0
-#define TS_WINDOW_SECONDS 10.0
-#define TS_MAX_SLEW_PER_PACKET 0.00005 /* Keeps inter-sample spacing within 0.05 ms of 1/fs. */
 
-/* DSI.h declares bool_t as int, but the library only sets the low byte; upper bytes are garbage. */
+/* Hypothesized ABI workaround: DSI.h declares bool_t as int, but the vendor DSI.py wrapper maps it to
+   ctypes.c_bool, suggesting only the low byte may be meaningful. Not verified against the Windows library. */
 #define DSI_BOOL(r) ((((unsigned int)(r)) & 0xFFu) != 0)
 
 static volatile sig_atomic_t keep_running = 1;
@@ -311,73 +306,20 @@ static void reset_tick(App *a, double now)
     }
 }
 
-static void timestamps_reset(App *a)
-{
-    a->ts_k = 0;
-    a->ts_started = a->ts_fallback = 0;
-}
-
-/* Nominal-rate sample clock anchored to device packet_time; offset to LSL clock tracks the
- * minimum receipt latency per packet (jitter only adds latency) and is slewed slowly. */
-static double sample_time(App *a, double packet_time, double now)
-{
-    unsigned long long k = a->ts_k++;
-    double fs = a->ts_fs, offset, target, delta;
-    if (a->ts_fallback) return now;
-    if (!isfinite(packet_time)) {
-        a->ts_fallback = 1;
-        marker(a, "timestamp_fallback", now);
-        return now;
-    }
-    if (!a->ts_started) {
-        a->ts_started = 1;
-        a->ts_offset = a->ts_window_min = a->ts_prev_window_min = now - packet_time;
-        a->ts_window_start = a->ts_base_pt = a->ts_last_pt = packet_time;
-        a->ts_base_k = k;
-        a->ts_packet_len = 0;
-    } else if (packet_time != a->ts_last_pt) {
-        double packet_duration = (a->ts_packet_len > 0 ? a->ts_packet_len : 1) / fs;
-        double expected = a->ts_base_pt + (double)(k - a->ts_base_k) / fs;
-        if (packet_time < a->ts_last_pt) {
-            a->ts_fallback = 1;
-            marker(a, "timestamp_fallback", now);
-            return now;
-        }
-        if (packet_time - expected > 1.5 * packet_duration) {
-            marker(a, "sample_gap", now);
-            a->ts_base_pt = packet_time;
-            a->ts_base_k = k;
-        }
-        offset = now - packet_time;
-        if (packet_time - a->ts_window_start >= TS_WINDOW_SECONDS) {
-            a->ts_prev_window_min = a->ts_window_min;
-            a->ts_window_min = offset;
-            a->ts_window_start = packet_time;
-        } else if (offset < a->ts_window_min) a->ts_window_min = offset;
-        target = a->ts_window_min < a->ts_prev_window_min ? a->ts_window_min : a->ts_prev_window_min;
-        delta = target - a->ts_offset;
-        if (delta > TS_MAX_SLEW_PER_PACKET) delta = TS_MAX_SLEW_PER_PACKET;
-        if (delta < -TS_MAX_SLEW_PER_PACKET) delta = -TS_MAX_SLEW_PER_PACKET;
-        a->ts_offset += delta;
-        a->ts_last_pt = packet_time;
-        a->ts_packet_len = 0;
-    }
-    ++a->ts_packet_len;
-    return a->ts_offset + a->ts_base_pt + (double)(k - a->ts_base_k) / fs;
-}
-
+/* packet_time is unused: like the original Neuroscale dsi2lsl, EEG is stamped by LSL at push. */
 static void on_sample(DSI_Headset h, double packet_time, void *userdata)
 {
     App *a = (App *)userdata;
-    double now = lsl_local_clock();
+    double now;
     int i, ready;
-    (void)h;
+    (void)h; (void)packet_time;
     if (!a->acquiring) return; /* Also discard trailing packets during a pause/shutdown. */
     ++a->sample_count;
     for (i = 0; i < a->channel_count; ++i)
         a->eeg_sample[i] = (float)DSI_Channel_GetSignal(a->channels[i]);
     if (DSI_Error()) { a->failed = 1; return; }
-    if (lsl_push_sample_ft(a->eeg, a->eeg_sample, sample_time(a, packet_time, now)) != 0) a->failed = 1;
+    if (lsl_push_sample_f(a->eeg, a->eeg_sample) != 0) a->failed = 1;
+    now = lsl_local_clock(); /* Impedance/state scheduling only; EEG keeps the implicit stamp. */
 
     /* Poll estimates at 1 Hz. This is NOT an independent 1 Hz hardware sampler. */
     if (now >= a->next_impedance) {
@@ -445,7 +387,6 @@ static int init_streams(App *a, const char *name)
     double rate = DSI_Headset_GetSamplingRate(a->h);
     a->channel_count = DSI_Headset_GetNumberOfChannels(a->h);
     if (check_dsi("Get channel counts") || total < 0 || a->channel_count <= 0 || rate <= 0) return -1;
-    a->ts_fs = rate;
     a->channels = (DSI_Channel *)calloc((size_t)a->channel_count, sizeof(*a->channels));
     a->sources = (DSI_Source *)calloc((size_t)total + 1, sizeof(*a->sources));
     a->eeg_sample = (float *)calloc((size_t)a->channel_count, sizeof(float));
@@ -466,7 +407,7 @@ static int init_streams(App *a, const char *name)
     snprintf(group, sizeof(group), "WearableSensing-%u-%s", DSI_Headset_GetSerialNumber(a->h), name);
     snprintf(id, sizeof(id), "%s-eeg", group);
     info = stream_info(a, name, "EEG", a->channel_count, rate, cft_float32, id, group,
-                       "nominal_rate_anchored_to_packet_time");
+                       "lsl_host_push_time");
     if (!info) return -1;
     desc = lsl_get_desc(info);
     lsl_append_child_value(desc, "reference", DSI_Headset_GetReferenceString(a->h));
@@ -534,7 +475,6 @@ static int start_acquisition(App *a)
         marker(a, "acquisition_start_failed", lsl_local_clock());
         return -1;
     }
-    timestamps_reset(a); /* Sample index k restarts with every acquisition. */
     a->acquiring = 1;
     a->next_impedance = a->next_snapshot = 0;
     marker(a, "acquisition_started", lsl_local_clock());
@@ -648,9 +588,8 @@ static void help(const char *program)
         "EEG remains unfiltered. Reset is an analog amplifier reset, not impedance calibration:\n"
         "  reset starts it, holds --reset-hold seconds, releases it and waits up to 3 s for mode 0;\n"
         "  impedance settle restarts after release. Any held reset is released on connect.\n"
-        "EEG timestamps: nominal rate anchored to DSI packet_time, slowly corrected to the LSL\n"
-        "  clock by minimum receipt latency; gaps re-anchor (sample_gap marker), non-monotonic\n"
-        "  packet_time falls back to receipt time (timestamp_fallback marker).\n", program);
+        "EEG timestamps: implicit LSL host push time (as the original Neuroscale dsi2lsl);\n"
+        "  arrival may be bursty. Not exact acquisition time; packet loss is not detected.\n", program);
 }
 
 int main(int argc, const char *argv[])
